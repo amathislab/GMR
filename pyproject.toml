@@ -37,7 +37,7 @@ dependencies = [
 Homepage = "https://github.com/YanjieZe/GMR"
 
 [tool.setuptools]
-packages = ["general_motion_retargeting"]
+packages = {find = {}}
 
 [tool.uv.sources]
 smplx = { git = "https://github.com/ZhengyiLuo/smplx" }
