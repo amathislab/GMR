@@ -240,6 +240,13 @@ python scripts/smplx_to_robot.py --smplx_file <path_to_smplx_data> --robot <path
 By default you should see the visualization of the retargeted robot motion in a mujoco window.
 If you want to record video, add `--record_video` and `--video_path <your_video_path,mp4>`.
 
+**Headless rendering** (servers without display): Prefix commands with `MUJOCO_GL=egl` for offscreen rendering:
+```bash
+MUJOCO_GL=egl python scripts/smplx_to_robot.py --smplx_file <path> --robot unitree_g1 --record_video
+# Or use the SMPL-H example:
+MUJOCO_GL=egl python examples/headless_rendering_smplh.py --smplh_file <path_to_amass.npz>
+```
+
 - `--rate_limit` is used to limit the rate of the retargeted robot motion to keep the same as the human motion. If you want it as fast as possible, remove `--rate_limit`.
 
 Retarget a folder of motions:

@@ -4,12 +4,74 @@ import torch
 from scipy.spatial.transform import Rotation as R
 from smplx.joint_names import JOINT_NAMES
 from scipy.interpolate import interp1d
+from smplx import SMPLH as _SMPLH
 
 import general_motion_retargeting.utils.lafan_vendor.utils as utils
+
+
+# SMPLH joint names (52 joints: 22 body + 30 hands)
+SMPLH_BONE_ORDER_NAMES = [
+    'Pelvis', 'L_Hip', 'R_Hip', 'Spine1', 'L_Knee', 'R_Knee', 'Spine2', 'L_Ankle', 'R_Ankle',
+    'Spine3', 'L_Foot', 'R_Foot', 'Neck', 'L_Collar', 'R_Collar', 'Head', 'L_Shoulder',
+    'R_Shoulder', 'L_Elbow', 'R_Elbow', 'L_Wrist', 'R_Wrist',
+    'L_Index1', 'L_Index2', 'L_Index3', 'L_Middle1', 'L_Middle2', 'L_Middle3',
+    'L_Pinky1', 'L_Pinky2', 'L_Pinky3', 'L_Ring1', 'L_Ring2', 'L_Ring3',
+    'L_Thumb1', 'L_Thumb2', 'L_Thumb3',
+    'R_Index1', 'R_Index2', 'R_Index3', 'R_Middle1', 'R_Middle2', 'R_Middle3',
+    'R_Pinky1', 'R_Pinky2', 'R_Pinky3', 'R_Ring1', 'R_Ring2', 'R_Ring3',
+    'R_Thumb1', 'R_Thumb2', 'R_Thumb3'
+]
+
+
+class SMPLH_Parser(_SMPLH):
+    """SMPL-H parser with special handling for AMASS data with 16 betas.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super(SMPLH_Parser, self).__init__(*args, **kwargs)
+        self.device = next(self.parameters()).device
+        self.joint_names = SMPLH_BONE_ORDER_NAMES
+        self.zero_pose = torch.zeros(1, 156).float()
+
+    def forward(self, *args, **kwargs):
+        smpl_output = super(SMPLH_Parser, self).forward(*args, **kwargs)
+        return smpl_output
+
+    def get_joints_verts(self, pose, th_betas=None, th_trans=None):
+        """
+        Get joints and vertices from pose parameters.
+
+        Args:
+            pose: Pose tensor of shape (batch_size, 156)
+            th_betas: Shape parameters (can be 10 or 16 betas)
+            th_trans: Translation tensor
+
+        Returns:
+            vertices, joints
+        """
+        if pose.shape[1] != 156:
+            pose = pose.reshape(-1, 156)
+        pose = pose.float()
+        if th_betas is not None:
+            th_betas = th_betas.float()
+
+        smpl_output = self.forward(
+            body_pose=pose[:, 3:66],
+            global_orient=pose[:, :3],
+            left_hand_pose=pose[:, 66:111],
+            right_hand_pose=pose[:, 111:156],
+            betas=th_betas,
+            transl=th_trans,
+        )
+        vertices = smpl_output.vertices
+        joints = smpl_output.joints
+        return vertices, joints
+
 
 def load_smpl_file(smpl_file):
     smpl_data = np.load(smpl_file, allow_pickle=True)
     return smpl_data
+
 
 def load_smplx_file(smplx_file, smplx_body_model_path):
     smplx_data = np.load(smplx_file, allow_pickle=True)
@@ -45,6 +107,106 @@ def load_smplx_file(smplx_file, smplx_body_model_path):
         human_height = 1.66 + 0.1 * smplx_data["betas"][0, 0]
     
     return smplx_data, body_model, smplx_output, human_height
+
+
+def load_smplh_file(smplh_file, smplh_body_model_path):
+    """Load SMPL-H data and create body model.
+
+    SMPL-H has 52 joints (22 body + 30 hands, no face) and 10 shape parameters.
+    Compatible with GMR since only body joints (0-21) are used for retargeting.
+
+    Handles two formats:
+    1. AMASS format: 'poses' array (N, 156) = root(3) + body(63) + hands(90)
+    2. Standard format: separate 'root_orient', 'pose_body', hand pose arrays
+    """
+    smplh_data = np.load(smplh_file, allow_pickle=True)
+
+    # Convert AMASS format to standard format if needed
+    if "poses" in smplh_data and "root_orient" not in smplh_data:
+        # AMASS SMPL+H format: poses = [root(3), body(63), left_hand(45), right_hand(45)]
+        poses = smplh_data["poses"]
+        smplh_data = dict(smplh_data)  # Convert to mutable dict
+        smplh_data["root_orient"] = poses[:, :3]
+        smplh_data["pose_body"] = poses[:, 3:66]
+        smplh_data["left_hand_pose"] = poses[:, 66:111]
+        smplh_data["right_hand_pose"] = poses[:, 111:156]
+        # AMASS uses 'mocap_framerate' key
+        if "mocap_framerate" in smplh_data:
+            smplh_data["mocap_frame_rate"] = torch.tensor(smplh_data["mocap_framerate"])
+
+    # Handle gender field (can be string or numpy array)
+    gender = smplh_data["gender"]
+    if hasattr(gender, 'item'):
+        gender = gender.item()
+    if isinstance(gender, bytes):
+        gender = gender.decode('utf-8')
+    gender = str(gender)
+
+    # Use SMPLH_Parser which handles AMASS data properly
+    body_model = SMPLH_Parser(
+        model_path=smplh_body_model_path,
+        gender="neutral",  # AMASS uses neutral gender
+        use_pca=False,
+    )
+
+    # Reconstruct full poses array for get_joints_verts (N, 156)
+    poses = torch.cat([
+        torch.tensor(smplh_data["root_orient"]).float(),
+        torch.tensor(smplh_data["pose_body"]).float(),
+        torch.tensor(smplh_data["left_hand_pose"]).float(),
+        torch.tensor(smplh_data["right_hand_pose"]).float(),
+    ], dim=1)
+
+    # Get betas - handle both single and batch format
+    betas = torch.tensor(smplh_data["betas"]).float()
+    if betas.ndim == 1:
+        betas = betas.view(1, -1)
+
+    # Get translation
+    trans = torch.tensor(smplh_data["trans"]).float()
+
+    # IMPORTANT: Repeat betas for each frame to match batch size
+    num_frames = poses.shape[0]
+    betas = betas.repeat(num_frames, 1)
+
+    # Use the custom get_joints_verts method that handles 16 betas properly
+    vertices, joints = body_model.get_joints_verts(
+        pose=poses,
+        th_betas=betas,
+        th_trans=trans,
+    )
+
+    # Create output dict similar to smplx output with all necessary attributes
+    class SMPLHOutput:
+        def __init__(self, vertices, joints, full_pose, global_orient, body_pose,
+                     left_hand_pose, right_hand_pose, betas):
+            self.vertices = vertices
+            self.joints = joints
+            self.full_pose = full_pose
+            self.global_orient = global_orient
+            self.body_pose = body_pose
+            self.left_hand_pose = left_hand_pose
+            self.right_hand_pose = right_hand_pose
+            self.betas = betas
+
+    smplh_output = SMPLHOutput(
+        vertices=vertices,
+        joints=joints,
+        full_pose=poses,
+        global_orient=torch.tensor(smplh_data["root_orient"]).float(),
+        body_pose=torch.tensor(smplh_data["pose_body"]).float(),
+        left_hand_pose=torch.tensor(smplh_data["left_hand_pose"]).float(),
+        right_hand_pose=torch.tensor(smplh_data["right_hand_pose"]).float(),
+        betas=betas,
+    )
+
+    # Height calculation same as SMPL-X (uses betas[0])
+    if len(smplh_data["betas"].shape) == 1:
+        human_height = 1.66 + 0.1 * smplh_data["betas"][0]
+    else:
+        human_height = 1.66 + 0.1 * smplh_data["betas"][0, 0]
+
+    return smplh_data, body_model, smplh_output, human_height
 
 
 def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
@@ -100,6 +262,22 @@ def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
         human_height = 1.66 + 0.1 * smplx_data['betas'][0, 0]
     
     return smplx_data, body_model, smplx_output, human_height
+
+
+def get_smplh_data(smplh_data, body_model, smplh_output, curr_frame):
+    """Extract SMPL-H joint data for a single frame.
+
+    Since SMPL-H body joints (0-21) are identical to SMPL-X, we use the same logic.
+    """
+    return get_smplx_data(smplh_data, body_model, smplh_output, curr_frame)
+
+
+def get_smplh_data_offline_fast(smplh_data, body_model, smplh_output, tgt_fps=30):
+    """Extract SMPL-H joint data for all frames with FPS conversion.
+
+    Since SMPL-H body joints (0-21) are identical to SMPL-X, we use the same logic.
+    """
+    return get_smplx_data_offline_fast(smplh_data, body_model, smplh_output, tgt_fps)
 
 
 def get_smplx_data(smplx_data, body_model, smplx_output, curr_frame):
